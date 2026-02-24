@@ -26,7 +26,7 @@ tau: 0.01
 discount_denom: 5
 discount_min: 0.95
 discount_max: 0.995
-buffer_size: 1_000_000
+buffer_size: 100_000
 exp_name: default
 data_dir: ???
 
@@ -64,8 +64,8 @@ dropout: 0.01
 simnorm_dim: 8
 
 # logging
-wandb_project: ???
-wandb_entity: ???
+wandb_project: memory-maze
+wandb_entity: fri-lifelong-dynamics
 wandb_silent: false
 enable_wandb: true
 save_csv: true
