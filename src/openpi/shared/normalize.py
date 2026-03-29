@@ -2,6 +2,7 @@ import json
 import pathlib
 
 import numpy as np
+import pyarrow  # noqa: F401 - must be imported before numpydantic to avoid segfault (JAX + numpydantic + pyarrow native lib conflict)
 import numpydantic
 import pydantic
 
