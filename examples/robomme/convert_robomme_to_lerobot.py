@@ -5,6 +5,7 @@ Usage:
 uv run examples/robomme/convert_robomme_to_lerobot.py --h5_data_dir /path/to/robomme_data_h5
 """
 
+import gc
 from pathlib import Path
 import shutil
 
@@ -75,8 +76,8 @@ def main(
                 "names": ["actions"],
             },
         },
-        image_writer_threads=10,
-        image_writer_processes=5,
+        image_writer_threads=8,
+        image_writer_processes=0,
     )
 
     for task in tasks:
@@ -130,6 +131,8 @@ def main(
                     })
                 
                 dataset.save_episode()
+                dataset.hf_dataset = dataset.create_hf_dataset()
+                gc.collect()
 
     print(f"Dataset saved to: {output_path}")
 
