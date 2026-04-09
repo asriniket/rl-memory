@@ -88,7 +88,10 @@ def main(
 
         print(f"Processing task: {task}")
         with h5py.File(h5_file, "r") as f:
-            episode_keys = sorted([k for k in f.keys() if k.startswith("episode_")])
+            episode_keys = sorted(
+                [k for k in f.keys() if k.startswith("episode_")],
+                key=lambda k: int(k.split("_")[1]),
+            )
             
             for ep_key in tqdm(episode_keys, desc=f"Converting {task}"):
                 episode = f[ep_key]
@@ -100,7 +103,10 @@ def main(
                 else:
                     task_goal = decode_h5_string(task_goal_raw)
 
-                timestep_keys = sorted([k for k in episode.keys() if k.startswith("timestep_")])
+                timestep_keys = sorted(
+                    [k for k in episode.keys() if k.startswith("timestep_")],
+                    key=lambda k: int(k.split("_")[1]),
+                )
                 
                 for ts_key in timestep_keys:
                     timestep = episode[ts_key]
