@@ -1,17 +1,11 @@
-# RoboMME Counting Task Suite - LoRA Finetuning
+# RoboMME Counting Task Suite LoRA Finetuning
 
 ## Dataset
 
-Download H5 files from HuggingFace:
+Convert H5 dataset LeRobot format and compute normalization statistics:
 
 ```bash
-python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Yinpei/robomme_data_h5', repo_type='dataset', local_dir='./robomme_data_h5')"
-```
-
-Convert to LeRobot format and compute normalization statistics:
-
-```bash
-uv run examples/robomme/convert_robomme_to_lerobot.py --h5_data_dir ./robomme_data_h5
+uv run examples/robomme/convert_robomme_to_lerobot.py --h5_data_dir ./robomme_datasets/h5
 
 uv run scripts/compute_norm_stats.py --config-name pi05_robomme_counting_lora
 ```
@@ -19,17 +13,19 @@ uv run scripts/compute_norm_stats.py --config-name pi05_robomme_counting_lora
 ## Training
 
 ```bash
-uv run scripts/train.py pi05_robomme_counting_lora --exp-name my_experiment --overwrite
+HF_LEROBOT_HOME=./robomme_datasets/lerobot XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_robomme_counting_lora --exp-name temporal-mem-test --overwrite --batch-size 1
 ```
 
-To resume:
+## Eval
+
+Start the policy server:
 
 ```bash
-uv run scripts/train.py pi05_robomme_counting_lora --exp-name my_experiment --resume
+uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_robomme_counting_lora --policy.dir=checkpoints/pi05_robomme_counting_lora/<exp_name>/<step>
 ```
 
-Disable W&B:
+Run the RoboMME counting eval script:
 
 ```bash
-WANDB_MODE=disabled uv run scripts/train.py pi05_robomme_counting_lora --exp-name my_experiment
+uv run examples/robomme/eval_robomme_counting.py --host 127.0.0.1 --port 8000
 ```
