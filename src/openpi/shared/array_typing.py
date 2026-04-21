@@ -4,7 +4,9 @@ import inspect
 from typing import TypeAlias, TypeVar, cast
 
 import beartype
+import flax.traverse_util as traverse_util
 import jax
+import numpy as np
 import jax._src.tree_util as private_tree_util
 import jax.core
 from jaxtyping import ArrayLike
@@ -59,6 +61,48 @@ def disable_typechecking():
     config.update("jaxtyping_disable", True)  # noqa: FBT003
     yield
     config.update("jaxtyping_disable", initial)
+
+
+def check_loaded_params_match_init(
+    *,
+    init: PyTree,
+    loaded: PyTree,
+    check_shapes: bool = True,
+    check_dtypes: bool = True,
+) -> None:
+    """Validates checkpoint weights against the model init parameter tree.
+
+    Every *concrete* array in ``loaded`` must appear under the same flattened key in ``init``,
+    with matching shape (and dtype when ``check_dtypes``). Keys present only in ``init`` are
+    allowed: they keep their initializer values after ``nnx.state.replace_by_pure_dict``.
+
+    This is the correct check for ``CheckpointWeightLoader``, which returns checkpoint tensors
+    plus only a regex-selected subset of missing paths (e.g. LoRA). New modules such as
+    MEM ``state_proj`` are intentionally absent from the base checkpoint and must not be
+    required in ``loaded``.
+    """
+    flat_init = traverse_util.flatten_dict(init, sep="/")
+    flat_loaded = traverse_util.flatten_dict(loaded, sep="/")
+
+    for key, loaded_leaf in flat_loaded.items():
+        if isinstance(loaded_leaf, jax.ShapeDtypeStruct):
+            continue
+        if key not in flat_init:
+            raise ValueError(
+                f"Loaded checkpoint has unknown parameter path {key!r}; it is not part of this model."
+            )
+        init_leaf = flat_init[key]
+        if check_shapes and hasattr(loaded_leaf, "shape") and hasattr(init_leaf, "shape"):
+            if tuple(loaded_leaf.shape) != tuple(init_leaf.shape):
+                raise ValueError(
+                    f"Shape mismatch for {key!r}: model expects {tuple(init_leaf.shape)}, "
+                    f"checkpoint has {tuple(loaded_leaf.shape)}"
+                )
+        if check_dtypes and hasattr(loaded_leaf, "dtype") and hasattr(init_leaf, "dtype"):
+            if np.dtype(loaded_leaf.dtype) != np.dtype(init_leaf.dtype):
+                raise ValueError(
+                    f"Dtype mismatch for {key!r}: model expects {init_leaf.dtype}, checkpoint has {loaded_leaf.dtype}"
+                )
 
 
 def check_pytree_equality(*, expected: PyTree, got: PyTree, check_shapes: bool = False, check_dtypes: bool = False):

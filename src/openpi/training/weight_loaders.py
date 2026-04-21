@@ -23,8 +23,10 @@ class WeightLoader(Protocol):
                 represent the model's parameters.
 
         Returns:
-            Loaded parameters. The structure must be identical to `params`. If returning a subset of
-            the parameters the loader must merge the loaded parameters with `params`.
+            Loaded parameters merged into the reference tree where applicable. The result may omit
+            keys that are not in the checkpoint; those weights keep their initializer values after
+            `replace_by_pure_dict`. Every key that *is* returned must match `params` in shape and dtype
+            at that path (see `openpi.shared.array_typing.check_loaded_params_match_init`).
         """
 
 

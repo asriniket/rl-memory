@@ -200,6 +200,17 @@ class SubsampleActions(DataTransformFn):
         return data
 
 
+def _current_state_for_action_delta(state, actions) -> np.ndarray:
+    """Proprio at the prediction timestep (last memory frame), not the full K-stack."""
+    state = np.asarray(state)
+    actions = np.asarray(actions)
+    if state.ndim < 2:
+        return state
+    if state.shape[-2] != actions.shape[-2]:
+        return state[..., -1, :]
+    return state
+
+
 @dataclasses.dataclass(frozen=True)
 class DeltaActions(DataTransformFn):
     """Repacks absolute actions into delta action space."""
@@ -214,6 +225,7 @@ class DeltaActions(DataTransformFn):
             return data
 
         state, actions = data["state"], data["actions"]
+        state = _current_state_for_action_delta(state, actions)
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
@@ -236,6 +248,7 @@ class AbsoluteActions(DataTransformFn):
             return data
 
         state, actions = data["state"], data["actions"]
+        state = _current_state_for_action_delta(state, actions)
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)

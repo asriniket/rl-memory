@@ -98,6 +98,14 @@ class DataConfig:
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
+    # MEM short-term memory (Torne et al. 2025). Negative-to-zero second offsets
+    # used to request a stack of historical frames/states from LeRobot's
+    # `delta_timestamps` mechanism. When None the dataset returns a single
+    # current-timestep observation (default behavior).
+    memory_timestamps: Sequence[float] | None = None
+    # LeRobot dataset keys to stack along the memory horizon (images, state, ...).
+    memory_obs_keys: Sequence[str] = ()
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -494,11 +502,22 @@ class LeRobotRoboMMEDataConfig(DataConfigFactory):
 
         model_transforms = ModelTransformFactory()(model_config)
 
+        memory_timestamps: Sequence[float] | None = None
+        memory_obs_keys: Sequence[str] = ()
+        if isinstance(model_config, pi0_config.Pi0Config) and model_config.num_memory_frames > 1:
+            k = model_config.num_memory_frames
+            stride = model_config.memory_stride_seconds
+            # Frames ordered oldest -> current; current has offset 0.
+            memory_timestamps = tuple(-float(stride) * (k - 1 - i) for i in range(k))
+            memory_obs_keys = ("front_rgb", "wrist_rgb", "joint_state", "gripper_state")
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            memory_timestamps=memory_timestamps,
+            memory_obs_keys=memory_obs_keys,
         )
 
 
@@ -811,6 +830,10 @@ _CONFIGS = [
             action_horizon=10,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
+            # MEM short-term memory: K=6 frames at 1s stride (~5s of history)
+            # matches the paper's pretraining configuration (Torne et al. 2025).
+            num_memory_frames=6,
+            memory_stride_seconds=1.0,
         ),
         data=LeRobotRoboMMEDataConfig(
             repo_id="robomme_counting",
@@ -822,6 +845,8 @@ _CONFIGS = [
             action_horizon=10,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
+            num_memory_frames=6,
+            memory_stride_seconds=1.0,
         ).get_freeze_filter(),
         ema_decay=None,
         num_train_steps=30_000,

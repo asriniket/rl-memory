@@ -10,7 +10,9 @@ from typing_extensions import override
 from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
+import openpi.models.lora as _lora
 import openpi.models.siglip as _siglip
+import openpi.models.siglip_video as _siglip_video
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
@@ -67,6 +69,7 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.num_memory_frames = config.num_memory_frames
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -78,21 +81,39 @@ class Pi0(_model.BaseModel):
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
-        img = nnx_bridge.ToNNX(
-            _siglip.Module(
-                num_classes=paligemma_config.width,
-                variant="So400m/14",
-                pool_type="none",
-                scan=True,
-                dtype_mm=config.dtype,
+        if self.num_memory_frames > 1:
+            # LoRA sidecars on the ViT attention/MLP projections keep the
+            # pretrained SigLIP base weights pinned while the encoder learns
+            # a low-rank delta (Hu et al. 2021).
+            img = nnx_bridge.ToNNX(
+                _siglip_video.Module(
+                    num_classes=paligemma_config.width,
+                    variant="So400m/14",
+                    dtype_mm=config.dtype,
+                    num_frames=self.num_memory_frames,
+                    lora_config=_lora.LoRAConfig(rank=16, alpha=16.0),
+                )
             )
-        )
+        else:
+            img = nnx_bridge.ToNNX(
+                _siglip.Module(
+                    num_classes=paligemma_config.width,
+                    variant="So400m/14",
+                    pool_type="none",
+                    scan=True,
+                    dtype_mm=config.dtype,
+                )
+            )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            if self.num_memory_frames > 1:
+                # Continuous K-token proprio history injected into the PaliGemma prefix
+                # (Torne et al. 2025, Section III-D).
+                self.state_proj = nnx.Linear(config.action_dim, paligemma_config.width, rngs=rngs)
         else:
             self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -123,6 +144,13 @@ class Pi0(_model.BaseModel):
             )
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
+
+        if self.num_memory_frames > 1:
+            # Continuous K-token proprio history (Torne et al. 2025, Section III-D).
+            state_tokens = self.state_proj(obs.state)
+            tokens.append(state_tokens)
+            input_mask.append(jnp.ones(state_tokens.shape[:2], dtype=jnp.bool_))
+            ar_mask += [False] * state_tokens.shape[1]
 
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:

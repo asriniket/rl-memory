@@ -28,20 +28,69 @@ class Args:
     video_dir: pathlib.Path = pathlib.Path("runs/eval_videos")
     video_fps: int = 30
 
+    # MEM short-term memory. Must match the training config for the checkpoint
+    # being evaluated (see `pi05_robomme_counting_lora`).
+    num_memory_frames: int = 6
+    memory_stride_seconds: float = 1.0
 
-def env_obs_to_policy_obs(obs: dict, task_goal: str) -> dict:
-    front_rgb = np.asarray(obs["front_rgb_list"])
-    wrist_rgb = np.asarray(obs["wrist_rgb_list"])
-    joint_state = np.asarray(obs["joint_state_list"], dtype=np.float32)
-    gripper_state = np.asarray(obs["gripper_state_list"], dtype=np.float32)
+
+def _single_frame_obs(obs: dict) -> dict:
+    front_rgb = np.asarray(obs["front_rgb_list"][-1], dtype=np.uint8)
+    wrist_rgb = np.asarray(obs["wrist_rgb_list"][-1], dtype=np.uint8)
+    joint_state = np.asarray(obs["joint_state_list"][-1], dtype=np.float32)
+    gripper_state = np.asarray(obs["gripper_state_list"][-1], dtype=np.float32)
     if gripper_state.shape[-1] == 2:
         gripper_state = gripper_state[..., :1]
-
     return {
-        "observation/front_rgb": front_rgb,
-        "observation/wrist_rgb": wrist_rgb,
-        "observation/joint_state": joint_state,
-        "observation/gripper_state": gripper_state,
+        "front_rgb": front_rgb,
+        "wrist_rgb": wrist_rgb,
+        "joint_state": joint_state,
+        "gripper_state": gripper_state,
+    }
+
+
+class MemoryBuffer:
+    """Client-side history for MEM short-term memory inference.
+
+    Stores every per-step observation and, on `snapshot`, emits K frames sampled
+    at `stride_steps` intervals ending at the most recent observation. The
+    earliest slots are padded with the first recorded observation when the
+    episode is shorter than `(num_frames - 1) * stride_steps + 1`, matching how
+    LeRobot's `delta_timestamps` handles episode-start padding during training.
+    """
+
+    def __init__(self, num_frames: int, stride_steps: int):
+        if num_frames < 1:
+            raise ValueError(f"num_frames must be >= 1, got {num_frames}")
+        if stride_steps < 1:
+            raise ValueError(f"stride_steps must be >= 1, got {stride_steps}")
+        self.num_frames = num_frames
+        self.stride_steps = stride_steps
+        self._history: list[dict] = []
+
+    def append(self, frame: dict) -> None:
+        self._history.append(frame)
+
+    def _frame_at(self, step_idx: int) -> dict:
+        clamped = max(step_idx, 0)
+        return self._history[clamped]
+
+    def snapshot(self) -> dict:
+        if not self._history:
+            raise RuntimeError("MemoryBuffer is empty; call append() before snapshot().")
+        latest = len(self._history) - 1
+        frames = [self._frame_at(latest - (self.num_frames - 1 - i) * self.stride_steps) for i in range(self.num_frames)]
+        if self.num_frames == 1:
+            return frames[0]
+        return {key: np.stack([f[key] for f in frames], axis=0) for key in frames[0]}
+
+
+def _policy_obs_from_snapshot(snapshot: dict, task_goal: str) -> dict:
+    return {
+        "observation/front_rgb": snapshot["front_rgb"],
+        "observation/wrist_rgb": snapshot["wrist_rgb"],
+        "observation/joint_state": snapshot["joint_state"],
+        "observation/gripper_state": snapshot["gripper_state"],
         "prompt": task_goal,
     }
 
@@ -54,6 +103,15 @@ def _grab_frame(obs: dict) -> np.ndarray:
 
 def main(args: Args) -> None:
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+
+    stride_steps = max(int(round(args.memory_stride_seconds * args.video_fps)), 1)
+    logging.info(
+        "Memory buffer: K=%s frames, stride=%.2fs (%s steps at %sfps)",
+        args.num_memory_frames,
+        args.memory_stride_seconds,
+        stride_steps,
+        args.video_fps,
+    )
 
     results: dict[str, list[bool]] = {}
 
@@ -73,6 +131,9 @@ def main(args: Args) -> None:
             obs, info = env.reset()
             task_goal = info["task_goal"][0]
 
+            buffer = MemoryBuffer(args.num_memory_frames, stride_steps)
+            buffer.append(_single_frame_obs(obs))
+
             frames: list[np.ndarray] = []
             if args.save_videos:
                 frames.append(_grab_frame(obs))
@@ -83,12 +144,13 @@ def main(args: Args) -> None:
 
             while not done:
                 if not action_plan:
-                    policy_obs = env_obs_to_policy_obs(obs, task_goal)
+                    policy_obs = _policy_obs_from_snapshot(buffer.snapshot(), task_goal)
                     action_chunk = client.infer(policy_obs)["actions"]
                     action_plan.extend(action_chunk[: args.replan_steps])
 
                 action = action_plan.popleft()
                 obs, _reward, terminated, truncated, info = env.step(action)
+                buffer.append(_single_frame_obs(obs))
 
                 if args.save_videos:
                     frames.append(_grab_frame(obs))

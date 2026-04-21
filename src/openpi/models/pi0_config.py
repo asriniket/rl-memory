@@ -32,13 +32,30 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # MEM short-term memory (Torne et al. 2025, Section III-C/D). When
+    # `num_memory_frames > 1`, the image encoder becomes a video encoder with
+    # causal-temporal attention, and proprioceptive state is emitted as K
+    # continuous tokens (one per frame). At K = 1 the model is identical to
+    # the default Pi0 / Pi0.5.
+    num_memory_frames: int = 1
+    memory_stride_seconds: float = 1.0
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
+        if self.num_memory_frames < 1:
+            raise ValueError(f"num_memory_frames must be >= 1, got {self.num_memory_frames}")
+        if self.num_memory_frames > 1:
+            if not self.pi05:
+                raise ValueError("num_memory_frames > 1 is only supported with pi05=True (paper instantiation).")
+            if self.memory_stride_seconds <= 0:
+                raise ValueError(f"memory_stride_seconds must be > 0 when memory is enabled, got {self.memory_stride_seconds}")
         if self.discrete_state_input is None:
-            object.__setattr__(self, "discrete_state_input", self.pi05)
+            object.__setattr__(self, "discrete_state_input", self.pi05 and self.num_memory_frames == 1)
+        elif self.discrete_state_input and self.num_memory_frames > 1:
+            raise ValueError("discrete_state_input is incompatible with num_memory_frames > 1; use continuous proprio history.")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",
@@ -62,7 +79,14 @@ class Pi0Config(_model.BaseModelConfig):
 
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
-        image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+        if self.num_memory_frames > 1:
+            image_spec = jax.ShapeDtypeStruct(
+                [batch_size, self.num_memory_frames, *_model.IMAGE_RESOLUTION, 3], jnp.float32
+            )
+            state_spec = jax.ShapeDtypeStruct([batch_size, self.num_memory_frames, self.action_dim], jnp.float32)
+        else:
+            image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
+            state_spec = jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():
@@ -77,7 +101,7 @@ class Pi0Config(_model.BaseModelConfig):
                     "left_wrist_0_rgb": image_mask_spec,
                     "right_wrist_0_rgb": image_mask_spec,
                 },
-                state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                state=state_spec,
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )
@@ -87,31 +111,42 @@ class Pi0Config(_model.BaseModelConfig):
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
         """Returns the freeze filter based on the model config."""
-        filters = []
-        has_lora = False
-        gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
+        frozen_groups = []
         action_expert_params_filter = nnx_utils.PathRegex(".*llm.*_1.*")
+        action_expert_excluded = False
+        has_lora = False
+
         if "lora" in self.paligemma_variant:
-            filters.append(
-                gemma_params_filter,
-            )
+            frozen_groups.append(nnx_utils.PathRegex(".*llm.*"))
             if "lora" not in self.action_expert_variant:
-                # If only freeze gemma params, exclude action expert params.
-                filters.append(
-                    nnx.Not(action_expert_params_filter),
-                )
+                # Only freeze the paligemma expert; leave the action expert trainable.
+                action_expert_excluded = True
             has_lora = True
         elif "lora" in self.action_expert_variant:
-            filters.append(
-                action_expert_params_filter,
+            frozen_groups.append(action_expert_params_filter)
+            has_lora = True
+
+        if self.num_memory_frames > 1:
+            # The video encoder carries LoRA sidecars on its attention/MLP
+            # projections; freeze the base SigLIP ViT weights and let only
+            # the sidecars (and the zero-init `head` projection) train.
+            frozen_groups.append(
+                nnx.All(
+                    nnx_utils.PathRegex(".*img.*"),
+                    nnx.Not(nnx_utils.PathRegex(".*img/head.*")),
+                )
             )
             has_lora = True
 
+        filters = []
+        if frozen_groups:
+            filters.append(nnx.Any(*frozen_groups) if len(frozen_groups) > 1 else frozen_groups[0])
+        if action_expert_excluded:
+            filters.append(nnx.Not(action_expert_params_filter))
         if has_lora:
-            # If any lora is used, exclude all lora params.
-            filters.append(
-                nnx.Not(nnx_utils.PathRegex(".*lora.*")),
-            )
+            # Exclude LoRA sidecars from the freeze so they remain trainable.
+            filters.append(nnx.Not(nnx_utils.PathRegex(".*lora.*")))
+
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)

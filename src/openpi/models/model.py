@@ -85,14 +85,19 @@ class Observation(Generic[ArrayT]):
 
     See `Observation.from_dict` to see the expected dictionary form. This is the format
     that should be produced by the data transforms.
+
+    When MEM short-term memory is enabled (`Pi0Config.num_memory_frames > 1`),
+    `images[key]` has shape `(*b, k, h, w, c)` and `state` has shape
+    `(*b, k, s)` where k is the memory horizon. `image_masks[key]` stays
+    shape `(*b,)` and represents per-camera availability (not per-frame).
     """
 
-    # Images, in [-1, 1] float32.
-    images: dict[str, at.Float[ArrayT, "*b h w c"]]
-    # Image masks, with same keys as images.
+    # Images, in [-1, 1] float32. `*bi` may include a leading K memory axis.
+    images: dict[str, at.Float[ArrayT, "*bi h w c"]]
+    # Image masks, with same keys as images; per-camera (no time axis).
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
-    # Low-dimensional robot state.
-    state: at.Float[ArrayT, "*b s"]
+    # Low-dimensional robot state. `*bs` may include a leading K memory axis.
+    state: at.Float[ArrayT, "*bs s"]
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -156,13 +161,14 @@ def preprocess_observation(
     if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
 
-    batch_shape = observation.state.shape[:-1]
-
     out_images = {}
     for key in image_keys:
         image = observation.images[key]
-        if image.shape[1:3] != image_resolution:
-            logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
+        # MEM short-term memory adds a leading time axis: `(B, K, H, W, C)`.
+        has_time_axis = image.ndim == 5
+        spatial_shape = image.shape[2:4] if has_time_axis else image.shape[1:3]
+        if spatial_shape != image_resolution:
+            logger.info(f"Resizing image {key} from {spatial_shape} to {image_resolution}")
             image = image_tools.resize_with_pad(image, *image_resolution)
 
         if train:
@@ -171,7 +177,7 @@ def preprocess_observation(
 
             transforms = []
             if "wrist" not in key:
-                height, width = image.shape[1:3]
+                height, width = image.shape[-3:-1]
                 transforms += [
                     augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
                     augmax.Resize(width, height),
@@ -181,19 +187,26 @@ def preprocess_observation(
                 augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
             ]
             sub_rngs = jax.random.split(rng, image.shape[0])
-            image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
+            aug = jax.vmap(augmax.Chain(*transforms))
+            if has_time_axis:
+                # Share the augmentation across frames to preserve temporal consistency.
+                frames_first = jnp.moveaxis(image, 1, 0)
+                frames_first = jax.vmap(aug, in_axes=(None, 0))(sub_rngs, frames_first)
+                image = jnp.moveaxis(frames_first, 0, 1)
+            else:
+                image = aug(sub_rngs, image)
 
             # Back to [-1, 1].
             image = image * 2.0 - 1.0
 
         out_images[key] = image
 
-    # obtain mask
+    # Per-camera availability mask, always rank-1 regardless of the memory axis.
+    mask_shape = (observation.state.shape[0],)
     out_masks = {}
     for key in out_images:
         if key not in observation.image_masks:
-            # do not mask by default
-            out_masks[key] = jnp.ones(batch_shape, dtype=jnp.bool)
+            out_masks[key] = jnp.ones(mask_shape, dtype=jnp.bool)
         else:
             out_masks[key] = jnp.asarray(observation.image_masks[key])
 
